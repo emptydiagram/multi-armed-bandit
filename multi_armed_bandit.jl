@@ -10,10 +10,6 @@ using Plots
 Action = UInt
 Reward = Float64
 
-SEED = 628
-bp_rng = MersenneTwister(SEED)
-
-
 # f::Function{T, (V, T)}
 # domain::AbstractVector{T}
 function argmax_rand_tiebreak(f::Function, domain::AbstractVector)
@@ -34,6 +30,11 @@ function argmax_rand_tiebreak(f::Function, domain::AbstractVector)
   #   println(" :: chose random idx = ", rand_mp_idx)
   # end
   return max_pairs[rand_mp_idx][2]
+end
+
+struct BanditProblem
+  action_values::Array{Float64}
+  reward_stddev::Float64
 end
 
 
@@ -90,24 +91,36 @@ function choose_action(player::EpsGreedySampleAverageBanditPlayer)
     return action
 end
 
-function generate_random_bandit_problem(K)
+function generate_random_bandit_problem(bp_rng, K, reward_stddev)
     random_q_values = randn(bp_rng, Float64, Int(K))
-    return random_q_values
+    return BanditProblem(random_q_values, reward_stddev)
 end
 
-function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K::UInt)
+function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K::UInt, reward_stddev::Float64, bp_rng)
   rewards_mean = zeros(Float64, num_run_steps)
   rewards_stddev = zeros(Float64, num_run_steps)
+  avg_pct_optimal = zeros(Float64, num_run_steps)
+
+  all_avg_reward_per_step = zeros(Float64, num_run_steps, num_runs)
+  all_stddev_reward_per_step = zeros(Float64, num_run_steps, num_runs)
+  all_avg_pct_optimal = zeros(Float64, num_run_steps, num_runs)
 
   for i in 1:num_runs
-    q_values= generate_random_bandit_problem(K)
+    bp = generate_random_bandit_problem(bp_rng, K, reward_stddev)
+    optimal_action = argmax(act -> bp.action_values[act], 1:K)
+    num_times_optimal_action_chosen = 0
     player = EpsGreedySampleAverageBanditPlayer(eps, K)
     Sn = 0.
     for j in 1:num_run_steps
       action = choose_action(player)
       # reward = q_values[action] + randn(bp_rng, Float64)
-      reward_gaussian = Normal(q_values[action], 1.)
-      reward = rand(reward_gaussian)
+      if action == optimal_action
+        num_times_optimal_action_chosen += 1
+      end
+      all_avg_pct_optimal[j,i] = num_times_optimal_action_chosen / j
+
+      reward_gaussian = Normal(bp.action_values[action], bp.reward_stddev)
+      reward = rand(bp_rng, reward_gaussian)
       reward_update(player, action, reward)
 
       # mu_n = mu_{n-1} + (x_n - mu_{n-1}) / n
@@ -115,16 +128,21 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
       # sigma_n = sqrt(S_n / n)
       avg_reward_curr = player.total_reward / player.total_num_sels
       if j == 1
-        rewards_mean[j] = avg_reward_curr
+        all_avg_reward_per_step[j, i] = avg_reward_curr
         Sn += 0.
       else
-        rewards_mean[j] = rewards_mean[j-1] + (avg_reward_curr - rewards_mean[j-1]) / Float64(j)
-        Sn += (avg_reward_curr - rewards_mean[j-1]) * (avg_reward_curr - rewards_mean[j])
+        all_avg_reward_per_step[j, i] = all_avg_reward_per_step[j-1, i] + (avg_reward_curr - all_avg_reward_per_step[j-1, i]) / Float64(j)
+        Sn += (avg_reward_curr - all_avg_reward_per_step[j-1, i]) * (avg_reward_curr - all_avg_reward_per_step[j, i])
       end
       stddev = sqrt(Sn / j)
-      rewards_stddev[j] = stddev
+      all_stddev_reward_per_step[j, i] = stddev
 
+      # update rewards_mean, rewards_stddev
+      rewards_mean[j] = rewards_mean[j] + (all_avg_reward_per_step[j,i] - rewards_mean[j]) / Float64(j)
+      rewards_stddev[j] = rewards_stddev[j] + (all_stddev_reward_per_step[j,i] - rewards_stddev[j]) / Float64(j)
+      avg_pct_optimal[j] = avg_pct_optimal[j] + (all_avg_pct_optimal[j,i] - avg_pct_optimal[j]) / Float64(j)
     end
+
     # println("run $i results")
     # println("estimated Q_t(a) | actual q_*(a)")
     # for action in 1:K
@@ -140,5 +158,5 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
   #   println("  avg rew $i: $(avg_rewards[i])")
   # end
   # println("  avg rew end: $(avg_rewards[end])")
-  return (rewards_mean, rewards_stddev)
+  return (all_avg_reward_per_step, all_stddev_reward_per_step, all_avg_pct_optimal)
 end
