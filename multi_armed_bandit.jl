@@ -37,24 +37,27 @@ struct BanditProblem
   reward_stddev::Float64
 end
 
+mutable struct EpsGreedySampleAverageState
+  average_reward::Float64
+  total_number_rewards::UInt
+end
+
 
 # K-armed bandit problem, player that uses sample-average to estimate action-value
-mutable struct EpsGreedySampleAverageBanditPlayer
+struct EpsGreedySampleAverageBanditPlayer
   total_reward_action::Dict{Action, Float64}
   total_num_sels_action::Dict{Action, UInt}
-  total_reward::Float64
-  total_num_sels::UInt
   K::UInt
   eps::Float64
+  state::EpsGreedySampleAverageState
 
   function EpsGreedySampleAverageBanditPlayer(eps::Float64, K::UInt)
     eps = eps
     K = K
     total_reward_action = Dict{Action, Float64}()
     total_num_sels_action = Dict{Action, UInt}()
-    total_reward = 0
-    total_num_sels = UInt(0)
-    return new(total_reward_action, total_num_sels_action, total_reward, total_num_sels, K, eps)
+    state = EpsGreedySampleAverageState(0., 0)
+    return new(total_reward_action, total_num_sels_action, K, eps, state)
   end
 end
 
@@ -70,8 +73,8 @@ function reward_update(player::EpsGreedySampleAverageBanditPlayer, action::Actio
   end
   player.total_num_sels_action[action] += 1
 
-  player.total_reward += reward
-  player.total_num_sels += 1
+  player.state.total_number_rewards += 1
+  player.state.average_reward += (reward - player.state.average_reward) / player.state.total_number_rewards
 end
 
 function action_value(player::EpsGreedySampleAverageBanditPlayer, action::Action)
@@ -99,11 +102,11 @@ end
 function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K::UInt, reward_stddev::Float64, bp_rng)
   avg_avg_reward_per_step = zeros(Float64, num_run_steps)
   avg_stddev_reward_per_step = zeros(Float64, num_run_steps)
-  avg_avg_pct_optimal = zeros(Float64, num_run_steps)
+  avg_frac_optimal = zeros(Float64, num_run_steps)
 
   all_avg_reward_per_step = zeros(Float64, num_run_steps, num_runs)
   all_stddev_reward_per_step = zeros(Float64, num_run_steps, num_runs)
-  all_avg_pct_optimal = zeros(Float64, num_run_steps, num_runs)
+  all_frac_optimal = zeros(Float64, num_run_steps, num_runs)
 
   for i in 1:num_runs
     bp = generate_random_bandit_problem(bp_rng, K, reward_stddev)
@@ -113,9 +116,13 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
     Sn = 0.
 
     # for this run, the reward avg/stddev and average % optimal action for each step in the run
+
+    # incrementally updated average reward per step, for each step
     run_avg_reward_per_step = zeros(Float64, num_run_steps)
+    # incrementally updated reward std. dev. per step, for each step
     run_stddev_reward_per_step = zeros(Float64, num_run_steps)
-    run_avg_pct_optimal = zeros(Float64, num_run_steps)
+    # % optimal action for each step
+    run_frac_optimal = zeros(Float64, num_run_steps)
 
     for j in 1:num_run_steps
       action = choose_action(player)
@@ -123,8 +130,8 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
       if action == optimal_action
         num_times_optimal_action_chosen += 1
       end
-      run_avg_pct_optimal[j] = num_times_optimal_action_chosen / j
-      all_avg_pct_optimal[j,i] = run_avg_pct_optimal[j]
+      run_frac_optimal[j] = num_times_optimal_action_chosen / j
+      all_frac_optimal[j,i] = run_frac_optimal[j]
 
       # reward = q_values[action] + randn(bp_rng, Float64)
       reward_gaussian = Normal(bp.action_values[action], bp.reward_stddev)
@@ -134,7 +141,7 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
       # mu_n = mu_{n-1} + (x_n - mu_{n-1}) / n
       # S_n = S_{n-1} + (x_n - mu_{n-1}) * (x_n - mu_n)
       # sigma_n = sqrt(S_n / n)
-      avg_reward_curr = player.total_reward / player.total_num_sels
+      avg_reward_curr = player.state.average_reward
       if j == 1
         run_avg_reward_per_step[j] = avg_reward_curr
         all_avg_reward_per_step[j, i] = run_avg_reward_per_step[j]
@@ -148,19 +155,21 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
       run_stddev_reward_per_step[j] = stddev
       all_stddev_reward_per_step[j, i] = run_stddev_reward_per_step[j]
 
-      # compare mean calculated from all rewards to the incrementally maintained mean
-      mean_all_avg_rws = mean(all_avg_reward_per_step[:, 1:i], dims=2)
-      for j in eachindex(mean_all_avg_rws)
-          if avg_avg_reward_per_step[j] != mean_all_avg_rws[j]
-              println("[j = $j] mismatch, $(avg_avg_reward_per_step[j]) =/= $(mean_all_avg_rws[j])")
-          end
-      end
-
       # incrementally update the averages over all runs
       avg_avg_reward_per_step[j] = avg_avg_reward_per_step[j] + (run_avg_reward_per_step[j] - avg_avg_reward_per_step[j]) / Float64(j)
       avg_stddev_reward_per_step[j] = avg_stddev_reward_per_step[j] + (run_stddev_reward_per_step[j] - avg_stddev_reward_per_step[j]) / Float64(j)
-      avg_avg_pct_optimal[j] = avg_avg_pct_optimal[j] + (run_avg_pct_optimal[j] - avg_avg_pct_optimal[j]) / Float64(j)
+      avg_frac_optimal[j] = avg_frac_optimal[j] + (run_frac_optimal[j] - avg_frac_optimal[j]) / Float64(j)
     end
+
+    # compare mean calculated from all rewards to the incrementally maintained mean
+    mean_all_avg_rws = mean(all_avg_reward_per_step[:, 1:i], dims=2)
+    for j in eachindex(mean_all_avg_rws)
+        println("{i = $i}, avg_avg_reward_per_step[$j] = $(avg_avg_reward_per_step[j])")
+        if avg_avg_reward_per_step[j] != mean_all_avg_rws[j]
+            println("{i = $i, j = $j} mismatch, $(avg_avg_reward_per_step[j]) =/= $(mean_all_avg_rws[j])")
+        end
+    end
+
 
     # println("run $i results")
     # println("estimated Q_t(a) | actual q_*(a)")
@@ -173,10 +182,11 @@ function run_bandit_problems(num_runs::Int, num_run_steps::Int, eps::Float64, K:
     # end
     # println("  avg rew end: $(avg_rewards_curr[end])")
   end
+
   # for i in eachindex(avg_rewards)
   #   println("  avg rew $i: $(avg_rewards[i])")
   # end
   # println("  avg rew end: $(avg_rewards[end])")
-  return (avg_avg_reward_per_step, avg_stddev_reward_per_step, avg_avg_pct_optimal,
-    all_avg_reward_per_step, all_stddev_reward_per_step, all_avg_pct_optimal)
+  return (avg_avg_reward_per_step, avg_stddev_reward_per_step, avg_frac_optimal,
+    all_avg_reward_per_step, all_stddev_reward_per_step, all_frac_optimal)
 end
